@@ -1,12 +1,12 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import json
 from time import localtime, time
 from torch.utils.data import random_split
 from transformers import CLIPModel, AutoTokenizer, AutoModel, TrainingArguments, Trainer, LlamaModel, LlavaForConditionalGeneration
-
+from torch.utils.data import DataLoader
 from dataset import CC595kDataset, CC595kDataCollator
 from model import MyLlava, MyLlavaProjector
 
@@ -52,37 +52,16 @@ with open(model_path + "/config.json", 'w') as file:
     file.write(json_string)
 
 # model
-tokenizer = AutoTokenizer.from_pretrained(os.path.join(cfg.checkpoint_path, 'tokenizer'))
-image_encoder = CLIPModel.from_pretrained(os.path.join(cfg.checkpoint_path, 'clip')).vision_model
-projector = MyLlavaProjector(cfg)
-llm = AutoModel.from_pretrained(os.path.join(cfg.checkpoint_path, "Meta-Llama-3.1-8B"))
-model = MyLlava(cfg, image_encoder, llm, projector)
-
-# dataset
-dataset = CC595kDataset(cfg, tokenizer)
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-training_args = TrainingArguments(
-    output_dir=cfg.output_dir,
-    learning_rate=cfg.learning_rate,
-    per_device_train_batch_size=cfg.per_device_train_batch_size,
-    per_device_eval_batch_size=cfg.per_device_eval_batch_size,
-    num_train_epochs=cfg.train_epochs,
-    weight_decay=cfg.weight_decay,
-    eval_strategy=cfg.eval_strategy,
-    save_strategy=cfg.save_strategy,
-    remove_unused_columns=False
-)
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
-    tokenizer=tokenizer,
-    data_collator=CC595kDataCollator(tokenizer)
-)
-
-trainer.train()
-trainer.save_state()
+tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3.1-8B')
+tokenizer.bos_token = '<s>'
+tokenizer.bos_token_id = 128000
+tokenizer.eos_token = '</s>'
+tokenizer.eos_token_id = 128001
+tokenizer.pad_token = '<pad>'
+tokenizer.pad_token_id = 128002
+tokenizer.unk_token = '<unk>'
+tokenizer.unk_token_id = 128003
+tokenizer.sep_token = '<image>'
+tokenizer.sep_token_id = 128004
+# 确保新符号的ID与原符号的ID相同
+tokenizer.save_pretrained(os.path.join(cfg.checkpoint_path, 'tokenizer'))

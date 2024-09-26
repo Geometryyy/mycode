@@ -9,11 +9,6 @@ from transformers.modeling_utils import GenerationMixin
 
 class MyLlavaOutput(ModelOutput):
     """
-    Base class for Llava causal language model (or autoregressive) outputs.
-
-    Args:
-        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-            Language modeling loss (for next-token prediction).
         logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
@@ -51,9 +46,9 @@ class MyLlavaOutput(ModelOutput):
 class MyLlavaProjector(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.linear_1 = nn.Linear(cfg.imagebind_hidden_size, cfg.llama_hidden_size, bias=True)
+        self.linear_1 = nn.Linear(cfg.image_encoder_hidden_size, cfg.llm_hidden_size, bias=True)
         self.act = ACT2FN[cfg.projector_hidden_act]
-        self.linear_2 = nn.Linear(cfg.llama_hidden_size, cfg.llama_hidden_size, bias=True)
+        self.linear_2 = nn.Linear(cfg.llm_hidden_size, cfg.llm_hidden_size, bias=True)
 
     def forward(self, image_features):
         hidden_states = self.linear_1(image_features)
@@ -62,9 +57,6 @@ class MyLlavaProjector(nn.Module):
         return hidden_states
 
 LLAVA_INPUTS_DOCSTRING = r"""
-    Args:
-        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)):
         attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
             Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
@@ -88,11 +80,7 @@ LLAVA_INPUTS_DOCSTRING = r"""
 
             If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
             don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
-            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
-        inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-            Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
-            is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
-            model's internal embedding lookup matrix.
+            `decoder_input_ids` of shape `(batch_size, sequence_length)`. 
         vision_feature_layer (`int`, *optional*, defaults to -2):
             The index of the layer to select the vision feature.
         vision_feature_select_strategy (`str`, *optional*, defaults to `"default"`):
@@ -102,90 +90,39 @@ LLAVA_INPUTS_DOCSTRING = r"""
 
 
 class MyLlava(nn.Module, GenerationMixin):
-    def __init__(self, cfg, clip, llm, projector):
+    def __init__(self, cfg, image_encoder, llm, projector):
         super().__init__()
-        self.clip = clip
+        self.image_encoder = image_encoder
         self.projector = projector
-        self.language_model = llm
+        self.llm = llm
         self.cfg = cfg
 
-    def get_input_embeddings(self):
-        return self.language_model.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
-        self.language_model.set_input_embeddings(value)
-
-    def get_output_embeddings(self):
-        return self.language_model.get_output_embeddings()
-
-    def set_output_embeddings(self, new_embeddings):
-        self.language_model.set_output_embeddings(new_embeddings)
-
-    def set_decoder(self, decoder):
-        self.language_model.set_decoder(decoder)
-
-    def get_decoder(self):
-        return self.language_model.get_decoder()
-
-    def tie_weights(self):
-        return self.language_model.tie_weights()
-
-    def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask, labels):
+    def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask=None, labels=None):
         num_images, num_image_patches, embed_dim = image_features.shape
         batch_size, sequence_length = input_ids.shape
-        left_padding = not torch.sum(input_ids[:, -1] == torch.tensor(self.pad_token_id))
         # 1. Create a mask to know where special image tokens are
-        special_image_token_mask = input_ids == self.config.image_token_index
+        special_image_token_mask = input_ids == self.cfg.image_token_index
         num_special_image_tokens = torch.sum(special_image_token_mask, dim=-1)
-        # Compute the maximum embed dimension
         max_embed_dim = (num_special_image_tokens.max() * (num_image_patches - 1)) + sequence_length
-        batch_indices, non_image_indices = torch.where(input_ids != self.config.image_token_index)
-
+        batch_indices, non_image_indices = torch.where(input_ids != self.cfg.image_token_index)
         # 2. Compute the positions where text should be written
-        # Calculate new positions for text tokens in merged image-text sequence.
-        # `special_image_token_mask` identifies image tokens. Each image token will be replaced by `nb_text_tokens_per_images - 1` text tokens.
-        # `torch.cumsum` computes how each image token shifts subsequent text token positions.
-        # - 1 to adjust for zero-based indexing, as `cumsum` inherently increases indices by one.
         new_token_positions = torch.cumsum((special_image_token_mask * (num_image_patches - 1) + 1), -1) - 1
         nb_image_pad = max_embed_dim - 1 - new_token_positions[:, -1]
-        if left_padding:
-            new_token_positions += nb_image_pad[:, None]  # offset for left padding
         text_to_overwrite = new_token_positions[batch_indices, non_image_indices]
-
         # 3. Create the full embedding, already padded to the maximum position
-        final_embedding = torch.zeros(
-            batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device
-        )
-        final_attention_mask = torch.zeros(
-            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device
-        )
+        final_embedding = torch.zeros(batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        final_attention_mask = torch.zeros(batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device)
         if labels is not None:
-            final_labels = torch.full(
-                (batch_size, max_embed_dim), self.config.ignore_index, dtype=input_ids.dtype, device=input_ids.device
-            )
-        # In case the Vision model or the Language model has been offloaded to CPU, we need to manually
-        # set the corresponding tensors into their correct target device.
-        target_device = inputs_embeds.device
-        batch_indices, non_image_indices, text_to_overwrite = (
-            batch_indices.to(target_device),
-            non_image_indices.to(target_device),
-            text_to_overwrite.to(target_device),
-        )
-        attention_mask = attention_mask.to(target_device)
-
-        # 4. Fill the embeddings based on the mask. If we have ["hey" "<image>", "how", "are"]
-        # we need to index copy on [0, 577, 578, 579] for the text and [1:576] for the image features
+            final_labels = torch.full((batch_size, max_embed_dim), self.cfg.ignore_index, dtype=input_ids.dtype, device=input_ids.device)
+        # 4. Fill the embeddings based on the mask
         final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
         final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
         if labels is not None:
             final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
-
-        # 5. Fill the embeddings corresponding to the images. Anything that is not `text_positions` needs filling (#29835)
-        image_to_overwrite = torch.full(
-            (batch_size, max_embed_dim), True, dtype=torch.bool, device=inputs_embeds.device
-        )
+        # 5. Fill the embeddings corresponding to the images.
+        image_to_overwrite = torch.full((batch_size, max_embed_dim), True, dtype=torch.bool, device=inputs_embeds.device)
         image_to_overwrite[batch_indices, text_to_overwrite] = False
-        image_to_overwrite &= image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[:, None].to(target_device)
+        image_to_overwrite &= image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[:, None]
 
         if image_to_overwrite.sum() != image_features.shape[:-1].numel():
             raise ValueError(
@@ -208,67 +145,52 @@ class MyLlava(nn.Module, GenerationMixin):
 
         return final_embedding, final_attention_mask, final_labels, position_ids
 
-    def forward(
-        self,
-        input_ids,
-        pixel_values,
-        attention_mask,
-        position_ids,
-        past_key_values,
-        inputs_embeds,
-        labels,
-    ):
+    def forward(self, input_ids, pixel_values=None, attention_mask=None, position_ids=None, past_key_values=None, labels=None):
+        inputs_embeds = self.llm.embed_tokens(input_ids)
+        # Merge text and images
+        if pixel_values is not None and input_ids.shape[1] != 1:
+            for p in pixel_values:
+            hidden_states = self.image_encoder.pre_layrnorm(self.image_encoder.embeddings(pixel_values))
+            # this is not memory efficient at all (output_hidden_states=True) will save all the hidden states.
+            selected_image_feature = self.image_encoder.encoder(hidden_states, output_hidden_states=True)[self.cfg.feature_layer][:, 1:]
+            image_features = self.projector(selected_image_feature)
+            inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                image_features, inputs_embeds, input_ids, attention_mask, labels
+            )
 
-        if inputs_embeds is None:
-            # 1. Extra the input embeddings
-            inputs_embeds = self.get_input_embeddings()(input_ids)
+        # generation with cache
+        elif past_key_values is not None and pixel_values is None and input_ids.shape[1] == 1:
+            # Retrieve the first layer to inspect the logits and mask out the hidden states
+            # that are set to 0
+            first_layer_past_key_value = past_key_values[0][0][:, :, :, 0]
 
-            # 2. Merge text and images
-            if pixel_values is not None and input_ids.shape[1] != 1:
-                image_outputs = self.vision_tower(pixel_values, output_hidden_states=True)
-                # this is not memory efficient at all (output_hidden_states=True) will save all the hidden stated.
-                selected_image_feature = image_outputs.hidden_states[self.cfg.feature_layer][:, 1:]
+            # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
+            batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
 
-                image_features = self.projector(selected_image_feature)
-                inputs_embeds = inputs_embeds.to(image_features.dtype)
-                inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
-                    image_features, inputs_embeds, input_ids, attention_mask, labels
-                )
+            # Get the target length
+            target_length = input_ids.shape[1]
+            past_length = first_layer_past_key_value.shape[-1]
 
-            # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
-            # generation with cache
-            elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
-                # Retrieve the first layer to inspect the logits and mask out the hidden states
-                # that are set to 0
-                first_layer_past_key_value = past_key_values[0][0][:, :, :, 0]
+            extended_attention_mask = torch.ones(
+                (attention_mask.shape[0], past_length),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
 
-                # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
-                batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
+            # Filter out only the tokens that can be un-attended, this can happen
+            # if one uses Llava + Fused modules where the cache on the
+            # first iteration is already big enough, or if one passes custom cache
+            valid_indices = non_attended_tokens < extended_attention_mask.size(-1)
+            new_batch_index = batch_index[valid_indices]
+            new_non_attended_tokens = non_attended_tokens[valid_indices]
 
-                # Get the target length
-                target_length = input_ids.shape[1]
-                past_length = first_layer_past_key_value.shape[-1]
+            # Zero-out the places where we don't need to attend
+            extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
 
-                extended_attention_mask = torch.ones(
-                    (attention_mask.shape[0], past_length),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
+            attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
+            position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
-                # Filter out only the tokens that can be un-attended, this can happen
-                # if one uses Llava + Fused modules where the cache on the
-                # first iteration is already big enough, or if one passes custom cache
-                valid_indices = non_attended_tokens < extended_attention_mask.size(-1)
-                new_batch_index = batch_index[valid_indices]
-                new_non_attended_tokens = non_attended_tokens[valid_indices]
-
-                # Zero-out the places where we don't need to attend
-                extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
-
-                attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -target_length:]), dim=1)
-                position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
-
-        outputs = self.language_model(
+        outputs = self.llm(
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -359,6 +281,3 @@ class MyLlava(nn.Module, GenerationMixin):
             }
         )
         return model_inputs
-
-    def _reorder_cache(self, *args, **kwargs):
-        return self.language_model._reorder_cache(*args, **kwargs)
