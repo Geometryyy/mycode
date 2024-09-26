@@ -1,11 +1,11 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 # os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import json
 from time import localtime, time
 from torch.utils.data import random_split
-from transformers import CLIPModel, AutoTokenizer, AutoModel, TrainingArguments, Trainer, LlamaModel, LlavaForConditionalGeneration
+from transformers import CLIPModel, AutoTokenizer, AutoModel, TrainingArguments, Trainer, LlamaForCausalLM, LlamaModel, LlavaForConditionalGeneration
 
 from dataset import CC595kDataset, CC595kDataCollator
 from model import MyLlava, MyLlavaProjector
@@ -26,8 +26,9 @@ class TrainingConfigurations:
     save_strategy = 'steps'
     # llm-conversation
     system = "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language."
-    sep = "</s>"
+    input_template = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{humanSay}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     # model
+    image_token = "<image>"
     ignore_index = -100
     image_token_index = 128004
     pad_token_id = 128002
@@ -81,7 +82,7 @@ trainer = Trainer(
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     tokenizer=tokenizer,
-    data_collator=CC595kDataCollator(tokenizer)
+    data_collator=CC595kDataCollator(tokenizer, cfg.ignore_index)
 )
 
 trainer.train()

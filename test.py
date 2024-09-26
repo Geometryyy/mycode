@@ -53,10 +53,6 @@ with open(model_path + "/config.json", 'w') as file:
 
 # model
 tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3.1-8B')
-tokenizer.bos_token = '<s>'
-tokenizer.bos_token_id = 128000
-tokenizer.eos_token = '</s>'
-tokenizer.eos_token_id = 128001
 tokenizer.pad_token = '<pad>'
 tokenizer.pad_token_id = 128002
 tokenizer.unk_token = '<unk>'

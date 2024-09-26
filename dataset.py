@@ -6,11 +6,6 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 
-IGNORE_INDEX = -100
-IMAGE_TOKEN_INDEX = -200
-DEFAULT_IMAGE_TOKEN = "<image>"
-
-
 class CC595kDataset(Dataset):
     def __init__(self, cfg, tokenizer):
         super(CC595kDataset, self).__init__()
@@ -30,27 +25,17 @@ class CC595kDataset(Dataset):
 
     def __getitem__(self, i):
         source = self.list_data_dict[i]
-        image_name_list = source['image'] if isinstance(source['image'], list) else [source['image']]
-        images = []
-        for i in image_name_list:
-            image = Image.open(os.path.join(self.cfg.data_path, 'images', i)).convert('RGB')
-            image = self.data_transform(image)
-            images.append(image)
-        humanSay, llamaSay = source['conversations'][0]['value'], source['conversations'][1]['value']
-        # humanSay = (DEFAULT_IMAGE_TOKEN + '\n' + humanSay.replace(DEFAULT_IMAGE_TOKEN, '').strip()).strip()
-        conversation = f"[INST] <<SYS>>\n{self.cfg.system}\n<</SYS>>\n\n{humanSay} [/INST] " + llamaSay + " "
-        input_ids = self.tokenizer_image_token(conversation + self.cfg.sep, self.tokenizer)
-        target = input_ids.clone()
-        parts = conversation.split("[/INST] ")
-        parts[0] += "[/INST] "
-        conversation_len = len(self.tokenizer_image_token(conversation, self.tokenizer))
-        instruction_len = len(self.tokenizer_image_token(parts[0], self.tokenizer)) - 2
-        target[:1 + instruction_len], target[1 + conversation_len:] = IGNORE_INDEX, IGNORE_INDEX
-        images = torch.stack(images)
-        return {'input_ids': input_ids, 'labels': target, 'images': images}
+        image = Image.open(os.path.join(self.cfg.data_path, 'images', source['image'])).convert('RGB')
+        image = self.data_transform(image)
+        humanSay = self.cfg.image_token + '\n' + source['conversations'][0]['value'].replace(self.cfg.image_token, '').strip()
+        input_text = self.cfg.input_template.replace('{system}', self.cfg.system).replace('{humanSay}', humanSay)
+        label_text = source['conversations'][1]['value'] + '<|end_of_text|>'
+        input_ids = self.tokenizer_image_token(input_text, self.tokenizer)
+        labels = self.tokenizer_image_token(label_text, self.tokenizer)
+        return {'input_ids': input_ids, 'labels': labels, 'image': image}
     
     def tokenizer_image_token(self, prompt, tokenizer):
-        prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
+        prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split(self.cfg.image_token)]
         input_ids = [prompt_chunks[0][0]]
         tmpList = [ele for sublist in zip(prompt_chunks, [[self.cfg.image_token_index] * 2] * len(prompt_chunks)) for ele in sublist][:-1]
         for x in tmpList:
@@ -60,15 +45,16 @@ class CC595kDataset(Dataset):
 
 
 class CC595kDataCollator:
-    def __init__(self, tokenizer) -> None:
+    def __init__(self, tokenizer, ignore_index) -> None:
         self.tokenizer = tokenizer
+        self.ignore_index = ignore_index
 
     def __call__(self, instances):
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=self.ignore_index)
         input_ids, labels = input_ids[:, :self.tokenizer.model_max_length], labels[:, :self.tokenizer.model_max_length]
         batch = {'input_ids': input_ids, 'labels': labels, 'attention_mask': input_ids.ne(self.tokenizer.pad_token_id)}
-        batch['pixel_values'] = [instance['images'] for instance in instances]
+        batch['pixel_values'] = torch.stack([instance['image'] for instance in instances])
         return batch
     

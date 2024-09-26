@@ -11,27 +11,18 @@ class MyLlavaOutput(ModelOutput):
     """
         logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
-            `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
-
-            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
-            `past_key_values` input) to speed up sequential decoding.
         hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
             Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
         attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
             Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
-
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
         image_hidden_states (`tuple(torch.FloatTensor)`, *optional*):
             Tuple of `torch.FloatTensor` (one for the output of the image embeddings, `(batch_size, num_images,
             sequence_length, hidden_size)`.
-
             image_hidden_states of the model produced by the vision encoder, and optionally by the perceiver
     """
 
@@ -57,30 +48,6 @@ class MyLlavaProjector(nn.Module):
         return hidden_states
 
 LLAVA_INPUTS_DOCSTRING = r"""
-        attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-            [`PreTrainedTokenizer.__call__`] for details.
-
-            If `past_key_values` is used, optionally only the last `decoder_input_ids` have to be input (see
-            `past_key_values`).
-
-            If you want to change padding behavior, you should read [`modeling_opt._prepare_decoder_attention_mask`]
-            and modify to your needs. See diagram 1 in [the paper](https://arxiv.org/abs/1910.13461) for more
-            information on the default strategy.
-        position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
-            config.n_positions - 1]`. [What are position IDs?](../glossary#position-ids)
-        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
-            `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of shape
-            `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`.
-
-            Contains pre-computed hidden-states (key and values in the self-attention blocks and in the cross-attention
-            blocks) that can be used (see `past_key_values` input) to speed up sequential decoding.
-
-            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
-            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
-            `decoder_input_ids` of shape `(batch_size, sequence_length)`. 
         vision_feature_layer (`int`, *optional*, defaults to -2):
             The index of the layer to select the vision feature.
         vision_feature_select_strategy (`str`, *optional*, defaults to `"default"`):
@@ -97,67 +64,46 @@ class MyLlava(nn.Module, GenerationMixin):
         self.llm = llm
         self.cfg = cfg
 
-    def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask=None, labels=None):
-        num_images, num_image_patches, embed_dim = image_features.shape
+    def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask=None):
+        _, num_image_patches, embed_dim = image_features.shape
         batch_size, sequence_length = input_ids.shape
         # 1. Create a mask to know where special image tokens are
         special_image_token_mask = input_ids == self.cfg.image_token_index
-        num_special_image_tokens = torch.sum(special_image_token_mask, dim=-1)
-        max_embed_dim = (num_special_image_tokens.max() * (num_image_patches - 1)) + sequence_length
+        max_embed_dim = num_image_patches - 1 + sequence_length
         batch_indices, non_image_indices = torch.where(input_ids != self.cfg.image_token_index)
         # 2. Compute the positions where text should be written
         new_token_positions = torch.cumsum((special_image_token_mask * (num_image_patches - 1) + 1), -1) - 1
-        nb_image_pad = max_embed_dim - 1 - new_token_positions[:, -1]
         text_to_overwrite = new_token_positions[batch_indices, non_image_indices]
         # 3. Create the full embedding, already padded to the maximum position
         final_embedding = torch.zeros(batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
         final_attention_mask = torch.zeros(batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device)
-        if labels is not None:
-            final_labels = torch.full((batch_size, max_embed_dim), self.cfg.ignore_index, dtype=input_ids.dtype, device=input_ids.device)
         # 4. Fill the embeddings based on the mask
         final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
         final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
-        if labels is not None:
-            final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
         # 5. Fill the embeddings corresponding to the images.
         image_to_overwrite = torch.full((batch_size, max_embed_dim), True, dtype=torch.bool, device=inputs_embeds.device)
         image_to_overwrite[batch_indices, text_to_overwrite] = False
-        image_to_overwrite &= image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[:, None]
-
-        if image_to_overwrite.sum() != image_features.shape[:-1].numel():
-            raise ValueError(
-                f"The input provided to the model are wrong. The number of image tokens is {torch.sum(special_image_token_mask)} while"
-                f" the number of image given to the model is {num_images}. This prevents correct indexing and breaks batch generation."
-            )
-
-        final_embedding[image_to_overwrite] = image_features.contiguous().reshape(-1, embed_dim).to(target_device)
+        final_embedding[image_to_overwrite] = image_features.reshape(-1, embed_dim)
         final_attention_mask |= image_to_overwrite
         position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
-
-        # 6. Mask out the embedding at padding positions, as we later use the past_key_value value to determine the non-attended tokens.
-        batch_indices, pad_indices = torch.where(input_ids == self.pad_token_id)
+        # 6. Mask out the embedding at padding positions
+        batch_indices, pad_indices = torch.where(input_ids == self.cfg.pad_token_id)
         indices_to_mask = new_token_positions[batch_indices, pad_indices]
-
         final_embedding[batch_indices, indices_to_mask] = 0
 
-        if labels is None:
-            final_labels = None
-
-        return final_embedding, final_attention_mask, final_labels, position_ids
+        return final_embedding, final_attention_mask, position_ids
 
     def forward(self, input_ids, pixel_values=None, attention_mask=None, position_ids=None, past_key_values=None, labels=None):
         inputs_embeds = self.llm.embed_tokens(input_ids)
         # Merge text and images
         if pixel_values is not None and input_ids.shape[1] != 1:
-            for p in pixel_values:
             hidden_states = self.image_encoder.pre_layrnorm(self.image_encoder.embeddings(pixel_values))
             # this is not memory efficient at all (output_hidden_states=True) will save all the hidden states.
             selected_image_feature = self.image_encoder.encoder(hidden_states, output_hidden_states=True)[self.cfg.feature_layer][:, 1:]
             image_features = self.projector(selected_image_feature)
-            inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
-                image_features, inputs_embeds, input_ids, attention_mask, labels
+            inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(
+                image_features, inputs_embeds, input_ids, attention_mask
             )
-
         # generation with cache
         elif past_key_values is not None and pixel_values is None and input_ids.shape[1] == 1:
             # Retrieve the first layer to inspect the logits and mask out the hidden states
@@ -198,9 +144,7 @@ class MyLlava(nn.Module, GenerationMixin):
             use_cache=self.cfg.use_cache,
             return_dict=True
         )
-
         logits = outputs[0]
-
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
@@ -217,11 +161,7 @@ class MyLlava(nn.Module, GenerationMixin):
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1).to(shift_logits.device)
             )
 
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
-
-        return LlavaCausalLMOutputWithPast(
+        return MyLlavaOutput(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
