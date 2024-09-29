@@ -1,37 +1,18 @@
 import torch
-import torch.utils.checkpoint
 from torch import nn
+import transformers
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
-from transformers.modeling_outputs import ModelOutput
-from transformers.modeling_utils import GenerationMixin
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Union
 
-
-class MyLlavaOutput(ModelOutput):
-    """
-        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
-        image_hidden_states (`tuple(torch.FloatTensor)`, *optional*):
-            Tuple of `torch.FloatTensor` (one for the output of the image embeddings, `(batch_size, num_images,
-            sequence_length, hidden_size)`.
-            image_hidden_states of the model produced by the vision encoder, and optionally by the perceiver
-    """
-
-    loss = None
-    logits = None
-    past_key_values = None
-    hidden_states = None
-    attentions = None
-    image_hidden_states = None
+@dataclass
+class MyLlavaOutput(transformers.modeling_outputs.ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    past_key_values: Optional[List[torch.FloatTensor]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    image_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 
 class MyLlavaProjector(nn.Module):
@@ -47,18 +28,10 @@ class MyLlavaProjector(nn.Module):
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
 
-LLAVA_INPUTS_DOCSTRING = r"""
-        vision_feature_layer (`int`, *optional*, defaults to -2):
-            The index of the layer to select the vision feature.
-        vision_feature_select_strategy (`str`, *optional*, defaults to `"default"`):
-            The feature selection strategy used to select the vision feature from the vision backbone.
-            Can be one of `"default"` or `"full"`.
-"""
 
-
-class MyLlava(nn.Module, GenerationMixin):
+class MyLlava(transformers.modeling_utils.PreTrainedModel):
     def __init__(self, cfg, image_encoder, llm, projector):
-        super().__init__()
+        super().__init__(transformers.configuration_utils.PretrainedConfig())
         self.image_encoder = image_encoder
         self.projector = projector
         self.llm = llm
@@ -93,7 +66,7 @@ class MyLlava(nn.Module, GenerationMixin):
 
         return final_embedding, final_attention_mask, position_ids
 
-    def forward(self, input_ids, pixel_values=None, attention_mask=None, position_ids=None, past_key_values=None, labels=None):
+    def forward(self, input_ids, pixel_values=None, attention_mask=None, position_ids=None, past_key_values=None, labels=None, use_cache=None, **kwargs):
         inputs_embeds = self.llm.embed_tokens(input_ids)
         # Merge text and images
         if pixel_values is not None and input_ids.shape[1] != 1:
@@ -105,23 +78,11 @@ class MyLlava(nn.Module, GenerationMixin):
                 image_features, inputs_embeds, input_ids, attention_mask
             )
         # generation with cache
-        elif past_key_values is not None and pixel_values is None and input_ids.shape[1] == 1:
-            first_layer_past_key_value = past_key_values[0][0][:, :, :, 0]
-            batch_index, non_attended_token_ids = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
-            past_length = first_layer_past_key_value.shape[-1]
-            extended_attention_mask = torch.ones((attention_mask.shape[0], past_length), dtype=attention_mask.dtype, device=attention_mask.device)
-
-            # Filter out only the tokens that can be un-attended, this can happen
-            # if one uses Llava + Fused modules where the cache on the
-            # first iteration is already big enough, or if one passes custom cache
-            valid_indices = non_attended_token_ids < extended_attention_mask.size(-1)
-            new_batch_index = batch_index[valid_indices]
-            new_non_attended_tokens = non_attended_token_ids[valid_indices]
-
-            # Zero-out the places where we don't need to attend
-            extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
-
-            attention_mask = torch.cat((extended_attention_mask, attention_mask[:, -1:]), dim=1)
+        elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
+            past_length = past_key_values.key_cache[0].shape[-2]
+            batch_index, non_attended_token_ids = torch.where(past_key_values.key_cache[0][:, :, :, 0].sum(-2) == 0)
+            attention_mask = torch.ones((attention_mask.shape[0], past_length + 1), dtype=attention_mask.dtype, device=attention_mask.device)
+            attention_mask[batch_index, non_attended_token_ids] = 0
             position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
         outputs = self.llm(
@@ -129,7 +90,7 @@ class MyLlava(nn.Module, GenerationMixin):
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=self.cfg.use_cache,
+            use_cache=use_cache,
             return_dict=True
         )
         logits = outputs[0]
@@ -155,57 +116,24 @@ class MyLlava(nn.Module, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-        )
+        )    
+    """
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads."""
 
-    def prepare_inputs_for_generation(
-        self, input_ids, past_key_values=None, inputs_embeds=None, pixel_values=None, attention_mask=None, **kwargs
-    ):
-        if past_key_values is not None:
-            if isinstance(past_key_values, Cache):
-                cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values.seen_tokens
-            else:
-                cache_length = past_length = past_key_values[0][0].shape[2]
 
-            # Keep only the unprocessed tokens:
-            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
-            # input)
-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
-                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
-            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
-            # input_ids based on the past_length.
-            elif past_length < input_ids.shape[1]:
-                input_ids = input_ids[:, past_length:]
-            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
-            elif self.config.image_token_index in input_ids:
-                input_ids = input_ids[:, input_ids.shape[1] - 1 :]
-            # If the cache has seen more tokens than it can hold, then the cache has a size limit. Let's discard the
-            # older attention values, as their corresponding values are not part of the input.
-            if cache_length < past_length and attention_mask is not None:
-                attention_mask = attention_mask[:, -(cache_length + input_ids.shape[1]) :]
-
-        position_ids = kwargs.get("position_ids", None)
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
-                position_ids = position_ids[:, -input_ids.shape[1] :]
-
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        model_inputs.update(
-            {
-                "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-                "pixel_values": pixel_values,
-            }
-        )
-        return model_inputs
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
+                #     elif past_length < input_ids.shape[1]:
+                # input_ids = input_ids[:, past_length:]
+        kwargs['past_key_values'] = past_key_values if past_key_values else transformers.cache_utils.DynamicCache()
+        kwargs['input_ids'] = input_ids
+        return kwargs

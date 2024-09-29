@@ -6,11 +6,12 @@ import json
 from time import localtime, time
 from torch.utils.data import random_split
 from transformers import CLIPModel, AutoTokenizer, AutoModel, TrainingArguments, Trainer, LlamaForCausalLM, LlamaModel, LlavaForConditionalGeneration
+from transformers.configuration_utils import PretrainedConfig
 
 from dataset import CC595kDataset, CC595kDataCollator
 from model import MyLlava, MyLlavaProjector
 
-class TrainingConfigurations:
+class TrainingConfigurations():
     # paths
     checkpoint_path = '/mnt/zhaojingtong/checkpoints'
     data_path = '/mnt/zhaojingtong/data/cc-595k'
@@ -36,7 +37,6 @@ class TrainingConfigurations:
     feature_layer = -2
     image_encoder_hidden_size = 1024
     llm_hidden_size = 4096
-    use_cache = False
 
 
 # config
