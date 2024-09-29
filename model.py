@@ -1,12 +1,16 @@
 import torch
 from torch import nn
-import transformers
+from transformers.modeling_outputs import ModelOutput
 from transformers.activations import ACT2FN
+from transformers.modeling_utils import PreTrainedModel
+from transformers.configuration_utils import PretrainedConfig
+from transformers.cache_utils import DynamicCache
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
+
 
 @dataclass
-class MyLlavaOutput(transformers.modeling_outputs.ModelOutput):
+class MyLlavaOutput(ModelOutput):
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
     past_key_values: Optional[List[torch.FloatTensor]] = None
@@ -29,9 +33,9 @@ class MyLlavaProjector(nn.Module):
         return hidden_states
 
 
-class MyLlava(transformers.modeling_utils.PreTrainedModel):
+class MyLlava(PreTrainedModel):
     def __init__(self, cfg, image_encoder, llm, projector):
-        super().__init__(transformers.configuration_utils.PretrainedConfig())
+        super().__init__(PretrainedConfig())
         self.image_encoder = image_encoder
         self.projector = projector
         self.llm = llm
@@ -66,7 +70,20 @@ class MyLlava(transformers.modeling_utils.PreTrainedModel):
 
         return final_embedding, final_attention_mask, position_ids
 
-    def forward(self, input_ids, pixel_values=None, attention_mask=None, position_ids=None, past_key_values=None, labels=None, use_cache=None, **kwargs):
+    def forward(
+        self, 
+        input_ids, 
+        pixel_values=None, 
+        attention_mask=None, 
+        position_ids=None, 
+        past_key_values=None, 
+        labels=None, 
+        use_cache=None, 
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs
+    ):
         inputs_embeds = self.llm.embed_tokens(input_ids)
         # Merge text and images
         if pixel_values is not None and input_ids.shape[1] != 1:
@@ -134,6 +151,6 @@ class MyLlava(transformers.modeling_utils.PreTrainedModel):
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
                 #     elif past_length < input_ids.shape[1]:
                 # input_ids = input_ids[:, past_length:]
-        kwargs['past_key_values'] = past_key_values if past_key_values else transformers.cache_utils.DynamicCache()
+        kwargs['past_key_values'] = past_key_values if past_key_values else DynamicCache()
         kwargs['input_ids'] = input_ids
         return kwargs
