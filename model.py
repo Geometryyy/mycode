@@ -1,22 +1,8 @@
 import torch
 from torch import nn
-from transformers.modeling_outputs import ModelOutput
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
-from transformers.cache_utils import DynamicCache
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
-
-
-@dataclass
-class MyLlavaOutput(ModelOutput):
-    loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
-    past_key_values: Optional[List[torch.FloatTensor]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
-    image_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 
 class MyLlavaProjector(nn.Module):
@@ -40,8 +26,19 @@ class MyLlava(PreTrainedModel):
         self.projector = projector
         self.llm = llm
         self.cfg = cfg
+        for p in self.image_encoder.parameters():
+            p.requires_grad = False
 
-    def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask=None):
+    def is_pretrain(self, is_pretrain=True):
+        for p in self.llm.parameters():
+            p.requires_grad = not is_pretrain
+
+    def _merge_input_ids_with_image_features(self, image, input_ids, attention_mask, labels=None):
+        inputs_embeds = self.llm.model.embed_tokens(input_ids)
+        hidden_states = self.image_encoder.pre_layrnorm(self.image_encoder.embeddings(image))
+        # this is not memory efficient at all (output_hidden_states=True) will save all the hidden states.
+        selected_image_feature = self.image_encoder.encoder(hidden_states, output_hidden_states=True)[self.cfg.feature_layer][:, 1:]
+        image_features = self.projector(selected_image_feature)
         _, num_image_patches, embed_dim = image_features.shape
         batch_size, sequence_length = input_ids.shape
         # 1. Create a mask to know where special image tokens are
@@ -56,7 +53,12 @@ class MyLlava(PreTrainedModel):
         final_attention_mask = torch.zeros(batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device)
         # 4. Fill the embeddings based on the mask
         final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
-        final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
+        final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]        
+        if labels is not None:
+            final_labels = torch.full((batch_size, max_embed_dim), self.cfg.ignore_index, dtype=input_ids.dtype, device=input_ids.device)
+            final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
+        else:
+            final_labels = None
         # 5. Fill the embeddings corresponding to the images.
         image_to_overwrite = torch.full((batch_size, max_embed_dim), True, dtype=torch.bool, device=inputs_embeds.device)
         image_to_overwrite[batch_indices, text_to_overwrite] = False
@@ -68,89 +70,33 @@ class MyLlava(PreTrainedModel):
         indices_to_mask = new_token_positions[batch_indices, pad_indices]
         final_embedding[batch_indices, indices_to_mask] = 0
 
-        return final_embedding, final_attention_mask, position_ids
+        return final_embedding, final_attention_mask, final_labels, position_ids
 
-    def forward(
-        self, 
-        input_ids, 
-        pixel_values=None, 
-        attention_mask=None, 
-        position_ids=None, 
-        past_key_values=None, 
-        labels=None, 
-        use_cache=None, 
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs
-    ):
-        inputs_embeds = self.llm.embed_tokens(input_ids)
-        # Merge text and images
-        if pixel_values is not None and input_ids.shape[1] != 1:
-            hidden_states = self.image_encoder.pre_layrnorm(self.image_encoder.embeddings(pixel_values))
-            # this is not memory efficient at all (output_hidden_states=True) will save all the hidden states.
-            selected_image_feature = self.image_encoder.encoder(hidden_states, output_hidden_states=True)[self.cfg.feature_layer][:, 1:]
-            image_features = self.projector(selected_image_feature)
-            inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(
-                image_features, inputs_embeds, input_ids, attention_mask
+    def forward(self, input_ids=None, image=None, attention_mask=None, position_ids=None, past_key_values=None, labels=None, **kwargs):
+        if image is not None and input_ids.shape[1] != 1:
+            inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                image, input_ids, attention_mask, labels
             )
-        # generation with cache
-        elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
-            past_length = past_key_values.key_cache[0].shape[-2]
-            batch_index, non_attended_token_ids = torch.where(past_key_values.key_cache[0][:, :, :, 0].sum(-2) == 0)
-            attention_mask = torch.ones((attention_mask.shape[0], past_length + 1), dtype=attention_mask.dtype, device=attention_mask.device)
-            attention_mask[batch_index, non_attended_token_ids] = 0
-            position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
-
-        outputs = self.llm(
+        output = self.llm(
+            input_ids=None if inputs_embeds is not None else input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            return_dict=True
+            labels=labels,
+            use_cache=self.cfg.use_cache,
+            **kwargs
         )
-        logits = outputs[0]
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            if attention_mask is not None:
-                shift_attention_mask = attention_mask[..., 1:]
-                shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()
-                shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()
-            else:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1).to(shift_logits.device)
+
+        return output
+
+    def generate(self, input_ids=None, image=None, attention_mask=None, labels=None, **kwargs):
+        if image is not None:
+            inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                image, input_ids, attention_mask, labels
             )
+        else:
+            inputs_embeds = self.llm.model.embed_tokens(input_ids)
 
-        return MyLlavaOutput(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )    
-    """
-        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads."""
+        return self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, labels=labels, **kwargs)
 
-
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **kwargs):
-                #     elif past_length < input_ids.shape[1]:
-                # input_ids = input_ids[:, past_length:]
-        kwargs['past_key_values'] = past_key_values if past_key_values else DynamicCache()
-        kwargs['input_ids'] = input_ids
-        return kwargs
