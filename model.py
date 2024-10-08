@@ -92,7 +92,7 @@ class MyLlava(PreTrainedModel):
 
     def generate(self, input_ids=None, image=None, attention_mask=None, labels=None, **kwargs):
         if image is not None:
-            inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+            inputs_embeds, attention_mask, labels, _ = self._merge_input_ids_with_image_features(
                 image, input_ids, attention_mask, labels
             )
         else:
