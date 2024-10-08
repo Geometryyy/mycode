@@ -2,17 +2,18 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import json
 from time import localtime, time
-from torch.utils.data import random_split
-from transformers import CLIPModel, AutoTokenizer, LlamaForCausalLM, TrainingArguments, Trainer
+from datasets import load_dataset
+from transformers import AutoTokenizer, CLIPModel, LlamaForCausalLM, TrainingArguments, Trainer
 
-from dataset import CC595kDataset, CC595kDataCollator
+from preprocessor import CC595kPreprocessor
 from model import MyLlava, MyLlavaProjector
 
 class HyperParameters():
     def __init__(self) -> None:
         # paths
         self.checkpoint_path = '/mnt/zhaojingtong/checkpoints'
-        self.data_path = '/mnt/zhaojingtong/data/cc-595k'
+        self.data_json_path = '/mnt/zhaojingtong/data/cc-595ktest/chat.json'
+        self.data_image_path = '/mnt/zhaojingtong/data/cc-595ktest/images'
         self.output_dir = '/mnt/zhaojingtong/code/results'
         # train
         self.is_pretrain = True
@@ -26,7 +27,7 @@ class HyperParameters():
         self.save_strategy = 'steps'
         # llm-conversation
         self.system = "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language."
-        self.template = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{humanSay}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{llamasay}<|end_of_text|>"
+        self.template = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{human_say}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{llama_say}<|end_of_text|>"
         # model
         self.image_token = "<image>"
         self.ignore_index = -100
@@ -59,30 +60,26 @@ model = MyLlava(cfg, image_encoder, llm, projector)
 model.is_pretrain(cfg.is_pretrain)
 
 # dataset
-dataset = CC595kDataset(cfg, tokenizer)
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+dataset = load_dataset("json", data_files=cfg.data_json_path, split="train")
+preprocessor = CC595kPreprocessor(cfg, tokenizer)
+dataset = dataset.map(preprocessor, batched=True, remove_columns=["id", "image", "conversations"]).train_test_split(test_size=0.2, shuffle=True)
 
-training_args = TrainingArguments(
-    output_dir=cfg.output_dir,
-    learning_rate=cfg.learning_rate,
-    per_device_train_batch_size=cfg.per_device_train_batch_size,
-    per_device_eval_batch_size=cfg.per_device_eval_batch_size,
-    num_train_epochs=cfg.train_epochs,
-    weight_decay=cfg.weight_decay,
-    eval_strategy=cfg.eval_strategy,
-    save_strategy=cfg.save_strategy,
-    remove_unused_columns=False
-)
+# trainer and train
 trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    eval_dataset=val_dataset,
+    args=TrainingArguments(
+        output_dir=cfg.output_dir,
+        learning_rate=cfg.learning_rate,
+        per_device_train_batch_size=cfg.per_device_train_batch_size,
+        per_device_eval_batch_size=cfg.per_device_eval_batch_size,
+        num_train_epochs=cfg.train_epochs,
+        weight_decay=cfg.weight_decay,
+        eval_strategy=cfg.eval_strategy,
+        save_strategy=cfg.save_strategy
+    ),
+    train_dataset=dataset['train'],
+    eval_dataset=dataset['test'],
     tokenizer=tokenizer,
-    data_collator=CC595kDataCollator(tokenizer, cfg.ignore_index)
+    model=model
 )
-
 trainer.train()
 trainer.save_state()

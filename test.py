@@ -2,18 +2,18 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 import json
 from time import localtime, time
-from transformers import AutoTokenizer
-from torch.utils.data import DataLoader
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModel
 
-from dataset import CC595kDataset, CC595kDataCollator
-from model import MyLlava
+from preprocessor import CC595kPreprocessor
 
 
 class HyperParameters():
     def __init__(self) -> None:
         # paths
         self.checkpoint_path = '/mnt/zhaojingtong/checkpoints'
-        self.data_path = '/mnt/zhaojingtong/data/cc-595k'
+        self.data_json_path = '/mnt/zhaojingtong/data/cc-595ktest/chat.json'
+        self.data_image_path = '/mnt/zhaojingtong/data/cc-595ktest/images'
         self.output_dir = '/mnt/zhaojingtong/code/results'
         # llm-conversation
         self.system = "You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language."
@@ -33,11 +33,16 @@ with open(cfg.output_dir + "/hyperparameters.json", 'w') as file:
 
 # model
 tokenizer = AutoTokenizer.from_pretrained(os.path.join(cfg.checkpoint_path, 'tokenizer'))
-model = MyLlava.from_pretrained(cfg.checkpoint_path)
+model = AutoModel.from_pretrained(cfg.checkpoint_path)
+model.eval()
 model.cfg.use_cache = cfg.use_cache
 
 # dataset
-dataset = DataLoader(CC595kDataset(cfg, tokenizer), batch_size=4, collate_fn=CC595kDataCollator(tokenizer, cfg.ignore_index))
+dataset = load_dataset("json", data_files=cfg.data_json_path, split="train")
+preprocessor = CC595kPreprocessor(cfg, tokenizer)
+dataset = dataset.map(preprocessor, batched=True, remove_columns=["id", "image", "conversations"]).train_test_split(test_size=0.2, shuffle=True)
+
+# test
 for d in dataset:
     del d['labels']
     generate_ids = model.generate(**d, max_new_tokens=15)
